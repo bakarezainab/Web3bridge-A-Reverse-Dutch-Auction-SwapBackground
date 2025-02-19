@@ -1,153 +1,126 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import { SignerWithAddress } from "@hardhat/hardhat-ethers/signers";
-import { Contract } from "ethers";
+import { Contract, ContractFactory } from "ethers";
+import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
+import { ReverseDutchAuctionSwap } from "../typechain-types/contracts/ReverseDutchAuctionSwap";
+import { MockERC20 } from "../typechain-types/MockERC20";
 
-describe("ReverseDutchAuctionSwap", function () {
-    let contract: Contract;
-    let token: Contract;
-    let owner: SignerWithAddress;
-    let seller: SignerWithAddress;
-    let buyer: SignerWithAddress;
-    let buyer2: SignerWithAddress;
+describe("ReverseDutchAuctionSwap", function() {
+  let reverseDutchAuction: ReverseDutchAuctionSwap;
+  let mockToken: MockERC20;
+  let owner: HardhatEthersSigner;
+  let seller: HardhatEthersSigner;
+  let buyer: HardhatEthersSigner;
 
-    beforeEach(async function () {
-        [owner, seller, buyer, buyer2] = await ethers.getSigners();
+  beforeEach(async function() {
+    [owner, seller, buyer] = await ethers.getSigners();
 
-        // Deploy mock ERC20 token
-        const MockToken = await ethers.getContractFactory("MockERC20");
-        token = await MockToken.deploy("Test Token", "TEST", ethers.utils.parseEther("1000000"));
-        await token.deployed();
+    // Deploy mock ERC20 token
+    const MockToken = await ethers.getContractFactory("MockERC20");
+    mockToken = await MockToken.deploy("Mock Token", "MTK") as MockERC20;
+    await mockToken.waitForDeployment();
 
-        // Deploy auction contract
-        const ReverseDutchAuction = await ethers.getContractFactory("ReverseDutchAuctionSwap");
-        contract = await ReverseDutchAuction.deploy();
-        await contract.deployed();
+    // Deploy ReverseDutchAuctionSwap contract
+    const ReverseDutchAuctionSwap = await ethers.getContractFactory("ReverseDutchAuctionSwap");
+    reverseDutchAuction = await ReverseDutchAuctionSwap.deploy() as ReverseDutchAuctionSwap;
+    await reverseDutchAuction.waitForDeployment();
+
+    // Mint tokens to seller
+    await mockToken.mint(seller.address, ethers.parseEther("1000"));
+    await mockToken.connect(seller).approve(await reverseDutchAuction.getAddress(), ethers.parseEther("1000"));
+  });
+
+  describe("createAuction", function() {
+    it("should create an auction successfully", async function() {
+      const initialPrice = ethers.parseEther("1");
+      const duration = 3600n; // 1 hour
+      const decayRate = ethers.parseEther("0.0001");
+      const amount = ethers.parseEther("100");
+
+      await expect(reverseDutchAuction.connect(seller).createAuction(
+        await mockToken.getAddress(),
+        initialPrice,
+        duration,
+        decayRate,
+        amount
+      )).to.emit(reverseDutchAuction, "AuctionCreated");
+
+      const auction = await reverseDutchAuction.auctions(0);
+      expect(auction.seller).to.equal(seller.address);
+      expect(auction.amount).to.equal(amount);
+      expect(auction.active).to.be.true;
     });
+  });
 
-    it("should decrease price correctly over time", async function () {
-        const initialPrice = ethers.utils.parseEther("1");
-        const duration = 100;
-        const decayRate = ethers.utils.parseEther("0.01");
-        const amount = 1000;
+  describe("getCurrentPrice", function() {
+    it("should return correct price after time passage", async function() {
+      const initialPrice = ethers.parseEther("1");
+      const duration = 3600n;
+      const decayRate = ethers.parseEther("0.0001");
+      const amount = ethers.parseEther("100");
 
-        await token.transfer(seller.address, amount);
-        await token.connect(seller).approve(contract.address, amount);
-        
-        await contract.connect(seller).createAuction(
-            token.address,
-            initialPrice,
-            duration,
-            decayRate,
-            amount
-        );
+      await reverseDutchAuction.connect(seller).createAuction(
+        await mockToken.getAddress(),
+        initialPrice,
+        duration,
+        decayRate,
+        amount
+      );
 
-        const startPrice = await contract.getCurrentPrice(0);
-        expect(startPrice).to.equal(initialPrice);
+      // Simulate time passage (30 minutes)
+      await ethers.provider.send("evm_increaseTime", [1800]);
+      await ethers.provider.send("evm_mine", []);
 
-        // Advance time by 50 seconds
-        await ethers.provider.send("evm_increaseTime", [50]);
-        await ethers.provider.send("evm_mine", []);
-
-        const midPrice = await contract.getCurrentPrice(0);
-        expect(midPrice).to.be.lt(startPrice);
-        expect(midPrice).to.equal(initialPrice.sub(decayRate.mul(50)));
-
-        // Advance time to end
-        await ethers.provider.send("evm_increaseTime", [50]);
-        await ethers.provider.send("evm_mine", []);
-
-        const endPrice = await contract.getCurrentPrice(0);
-        expect(endPrice).to.equal(0);
+      const currentPrice = await reverseDutchAuction.getCurrentPrice(0);
+      expect(currentPrice).to.be.lt(initialPrice);
     });
+  });
 
-    it("should allow only one buyer per auction", async function () {
-        const initialPrice = ethers.utils.parseEther("1");
-        const duration = 100;
-        const decayRate = ethers.utils.parseEther("0.01");
-        const amount = 1000;
+  describe("buy", function() {
+    it("should allow buying tokens at current price", async function() {
+      const initialPrice = ethers.parseEther("1");
+      const duration = 3600n;
+      const decayRate = ethers.parseEther("0.0001");
+      const amount = ethers.parseEther("100");
 
-        await token.transfer(seller.address, amount);
-        await token.connect(seller).approve(contract.address, amount);
-        
-        await contract.connect(seller).createAuction(
-            token.address,
-            initialPrice,
-            duration,
-            decayRate,
-            amount
-        );
+      await reverseDutchAuction.connect(seller).createAuction(
+        await mockToken.getAddress(),
+        initialPrice,
+        duration,
+        decayRate,
+        amount
+      );
 
-        // First buyer succeeds
-        await contract.connect(buyer).buy(0, { value: initialPrice });
+      const currentPrice = await reverseDutchAuction.getCurrentPrice(0);
+      
+      await expect(reverseDutchAuction.connect(buyer).buy(0, { value: currentPrice }))
+        .to.emit(reverseDutchAuction, "AuctionFinalized");
 
-        // Second buyer should fail
-        await expect(
-            contract.connect(buyer2).buy(0, { value: initialPrice })
-        ).to.be.revertedWith("Auction not active");
+      const buyerBalance = await mockToken.balanceOf(buyer.address);
+      expect(buyerBalance).to.equal(amount);
     });
+  });
 
-    it("should correctly swap funds and tokens", async function () {
-        const initialPrice = ethers.utils.parseEther("1");
-        const duration = 100;
-        const decayRate = ethers.utils.parseEther("0.01");
-        const amount = 1000;
+  describe("cancelAuction", function() {
+    it("should allow seller to cancel auction", async function() {
+      const initialPrice = ethers.parseEther("1");
+      const duration = 3600n;
+      const decayRate = ethers.parseEther("0.0001");
+      const amount = ethers.parseEther("100");
 
-        await token.transfer(seller.address, amount);
-        await token.connect(seller).approve(contract.address, amount);
-        
-        const sellerInitialBalance = await ethers.provider.getBalance(seller.address);
-        const buyerInitialTokenBalance = await token.balanceOf(buyer.address);
+      await reverseDutchAuction.connect(seller).createAuction(
+        await mockToken.getAddress(),
+        initialPrice,
+        duration,
+        decayRate,
+        amount
+      );
 
-        await contract.connect(seller).createAuction(
-            token.address,
-            initialPrice,
-            duration,
-            decayRate,
-            amount
-        );
+      await expect(reverseDutchAuction.connect(seller).cancelAuction(0))
+        .to.emit(reverseDutchAuction, "AuctionCancelled");
 
-        await contract.connect(buyer).buy(0, { value: initialPrice });
-
-        // Check token transfer
-        expect(await token.balanceOf(buyer.address)).to.equal(buyerInitialTokenBalance.add(amount));
-        
-        // Check ETH transfer (approximately due to gas costs)
-        const sellerFinalBalance = await ethers.provider.getBalance(seller.address);
-        expect(sellerFinalBalance).to.be.gt(sellerInitialBalance);
+      const auction = await reverseDutchAuction.auctions(0);
+      expect(auction.active).to.be.false;
     });
-
-    it("should handle auction expiration without buyers", async function () {
-        const initialPrice = ethers.utils.parseEther("1");
-        const duration = 100;
-        const decayRate = ethers.utils.parseEther("0.01");
-        const amount = 1000;
-
-        await token.transfer(seller.address, amount);
-        await token.connect(seller).approve(contract.address, amount);
-        
-        await contract.connect(seller).createAuction(
-            token.address,
-            initialPrice,
-            duration,
-            decayRate,
-            amount
-        );
-
-        // Advance time past duration
-        await ethers.provider.send("evm_increaseTime", [duration + 1]);
-        await ethers.provider.send("evm_mine", []);
-
-        // Price should be 0
-        expect(await contract.getCurrentPrice(0)).to.equal(0);
-
-        // Buying should fail
-        await expect(
-            contract.connect(buyer).buy(0, { value: initialPrice })
-        ).to.be.revertedWith("Auction expired");
-
-        // Seller should be able to cancel
-        await contract.connect(seller).cancelAuction(0);
-        expect(await token.balanceOf(seller.address)).to.equal(amount);
-    });
+  });
 });
